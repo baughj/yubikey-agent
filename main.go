@@ -229,14 +229,14 @@ func (a *Agent) List() ([]*agent.Key, error) {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
 
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yk, piv.SlotSignature)
 	if err != nil {
 		return nil, err
 	}
 	return []*agent.Key{{
 		Format:  pk.Type(),
 		Blob:    pk.Marshal(),
-		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9a", a.serial),
+		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9c", a.serial),
 	}}, nil
 }
 
@@ -269,12 +269,12 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yk, piv.SlotSignature)
 	if err != nil {
 		return nil, err
 	}
 	priv, err := a.yk.PrivateKey(
-		piv.SlotAuthentication,
+		piv.SlotSignature,
 		pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
 		piv.KeyAuth{PINPrompt: a.getPIN},
 	)
@@ -310,7 +310,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		a.touchNotification = time.NewTimer(5 * time.Second)
+		a.touchNotification = time.NewTimer(time.Millisecond * 250)
 		go func() {
 			select {
 			case <-a.touchNotification.C:
@@ -339,7 +339,7 @@ func showNotification(message string) {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
-		appleScript := `display notification "%s" with title "yubikey-agent"`
+		appleScript := `display notification "%s" with title "yubikey-agent" sound name "Purr"`
 		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
 	case "linux":
 		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
