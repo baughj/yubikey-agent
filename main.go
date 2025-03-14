@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/go-piv/piv-go/piv"
-	"github.com/gopasspw/gopass/pkg/pinentry"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/terminal"
@@ -76,10 +75,6 @@ func main() {
 }
 
 func runAgent(socketPath string) {
-	if _, err := exec.LookPath(pinentry.GetBinary()); err != nil {
-		log.Fatalf("PIN entry program %q not found!", pinentry.GetBinary())
-	}
-
 	if terminal.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
@@ -165,16 +160,21 @@ func (a *Agent) ensureYK() error {
 	return nil
 }
 
+func (a *Agent) maybeReleaseYK() {
+	// On macOS, YubiKey 5s persist the PIN cache even across sessions (and even
+	// processes), so we can release the lock on the key, to let other
+	// applications like age-plugin-yubikey use it.
+	if runtime.GOOS != "darwin" || a.yk.Version().Major < 5 {
+		return
+	}
+	if err := a.yk.Close(); err != nil {
+		log.Println("Failed to automatically release YubiKey lock:", err)
+	}
+	a.yk = nil
+}
+
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
-	cards, err := piv.Cards()
-	if err != nil {
-		return nil, err
-	}
-	if len(cards) == 0 {
-		return nil, errors.New("no YubiKey detected")
-	}
-	// TODO: support multiple YubiKeys.
-	yk, err := piv.Open(cards[0])
+	yk, err := openYK()
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +184,30 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 	return yk, nil
 }
 
+func openYK() (yk *piv.YubiKey, err error) {
+	cards, err := piv.Cards()
+	if err != nil {
+		return nil, err
+	}
+	if len(cards) == 0 {
+		return nil, errors.New("no YubiKey detected")
+	}
+	// TODO: support multiple YubiKeys. For now, select the first one that opens
+	// successfully, to skip any internal unused smart card readers.
+	for _, card := range cards {
+		yk, err = piv.Open(card)
+		if err == nil {
+			return
+		}
+	}
+	return
+}
+
 func (a *Agent) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.yk != nil {
-		log.Println("Received SIGHUP, dropping YubiKey transaction...")
+		log.Println("Received HUP, dropping YubiKey transaction...")
 		err := a.yk.Close()
 		a.yk = nil
 		return err
@@ -200,26 +219,8 @@ func (a *Agent) getPIN() (string, error) {
 	if a.touchNotification != nil && a.touchNotification.Stop() {
 		defer a.touchNotification.Reset(5 * time.Second)
 	}
-	p, err := pinentry.New()
-	if err != nil {
-		return "", fmt.Errorf("failed to start %q: %w", pinentry.GetBinary(), err)
-	}
-	defer p.Close()
-	p.Set("title", "yubikey-agent PIN Prompt")
-	var retries string
-	if r, err := a.yk.Retries(); err == nil {
-		retries = fmt.Sprintf(" (%d tries remaining)", r)
-	}
-	p.Set("desc", fmt.Sprintf("YubiKey serial number: %d"+retries, a.serial))
-	p.Set("prompt", "Please enter your PIN:")
-
-	// Enable opt-in external PIN caching (in the OS keychain).
-	// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L324
-	p.Option("allow-external-password-cache")
-	p.Set("KEYINFO", fmt.Sprintf("--yubikey-id-%d", a.serial))
-
-	pin, err := p.GetPin()
-	return string(pin), err
+	r, _ := a.yk.Retries()
+	return getPIN(a.serial, r)
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
@@ -228,6 +229,7 @@ func (a *Agent) List() ([]*agent.Key, error) {
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
+	defer a.maybeReleaseYK()
 
 	pk, err := getPublicKey(a.yk, piv.SlotSignature)
 	if err != nil {
@@ -264,6 +266,7 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
+	defer a.maybeReleaseYK()
 
 	return a.signers()
 }
@@ -298,6 +301,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
+	defer a.maybeReleaseYK()
 
 	signers, err := a.signers()
 	if err != nil {
@@ -359,7 +363,7 @@ func (a *Agent) Remove(key ssh.PublicKey) error {
 	return ErrOperationUnsupported
 }
 func (a *Agent) RemoveAll() error {
-	return ErrOperationUnsupported
+	return a.Close()
 }
 func (a *Agent) Lock(passphrase []byte) error {
 	return ErrOperationUnsupported
